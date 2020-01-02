@@ -10,7 +10,7 @@ module ActiveRecord
 
         # Executes a SQL statement
         def execute(sql, name = nil)
-          log(sql, name) { @connection.exec(sql) }
+          log(sql, name) { with_auto_retry { @connection.exec(sql) } }
         end
 
         def clear_cache! # :nodoc:
@@ -24,21 +24,25 @@ module ActiveRecord
           log(sql, name, binds, type_casted_binds) do
             cursor = nil
             cached = false
-            if without_prepared_statement?(binds)
-              cursor = @connection.prepare(sql)
-            else
-              unless @statements.key? sql
-                @statements[sql] = @connection.prepare(sql)
+            with_auto_retry do
+              cursor = nil
+              cached = false
+              if without_prepared_statement?(binds)
+                cursor = @connection.prepare(sql)
+              else
+                unless @statements.key? sql
+                  @statements[sql] = @connection.prepare(sql)
+                end
+
+                cursor = @statements[sql]
+
+                cursor.bind_params(type_casted_binds)
+
+                cached = true
               end
 
-              cursor = @statements[sql]
-
-              cursor.bind_params(type_casted_binds)
-
-              cached = true
+              cursor.exec
             end
-
-            cursor.exec
 
             if (name == "EXPLAIN") && sql =~ /^EXPLAIN/
               res = true
@@ -260,6 +264,19 @@ module ActiveRecord
               end
               lob = lob_record[col.name]
               @connection.write_lob(lob, value.to_s, col.type == :binary)
+            end
+          end
+        end
+
+        private
+
+        def with_auto_retry
+          @connection.with_auto_retry do
+            begin
+              yield
+            rescue
+              @statements.clear
+              raise
             end
           end
         end

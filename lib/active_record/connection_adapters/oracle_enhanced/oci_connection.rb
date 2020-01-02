@@ -27,12 +27,31 @@ module ActiveRecord
     # OCI database interface for MRI
     module OracleEnhanced
       class OCIConnection < OracleEnhanced::Connection #:nodoc:
+        attr_reader :active #:nodoc:
+        alias :active? :active
+
+        cattr_accessor :auto_retry, default: false
+
+        class << self
+          alias :auto_retry? :auto_retry #:nodoc:
+        end
+
+        cattr_accessor :auto_retry_error_codes, default: [
+            28, # ORA-00028: your session has been killed
+          1012, # ORA-01012: not logged on
+          3113, # ORA-03113: end-of-file on communication channel
+          3114, # ORA-03114: not connected to ORACLE
+          3135  # ORA-03135: connection lost contact
+        ]
+
         def initialize(config)
-          @raw_connection = OCI8EnhancedAutoRecover.new(config, OracleEnhancedOCIFactory)
+          @raw_connection = OracleEnhancedOCIFactory.new_connection(config)
+          @config = config
           # default schema owner
           @owner = config[:schema]
           @owner ||= config[:username]
           @owner = @owner.to_s.upcase
+          @active = true
         end
 
         def raw_oci_connection
@@ -45,17 +64,9 @@ module ActiveRecord
           end
         end
 
-        def auto_retry
-          @raw_connection.auto_retry if @raw_connection
-        end
-
-        def auto_retry=(value)
-          @raw_connection.auto_retry = value if @raw_connection
-        end
-
         def logoff
           @raw_connection.logoff
-          @raw_connection.active = false
+          @active = false
         end
 
         def commit
@@ -78,19 +89,27 @@ module ActiveRecord
         # checks the connection, while #active? simply returns the last
         # known state.
         def ping
-          @raw_connection.ping
+          @raw_connection.exec("select 1 from dual") { |r| nil }
+          @active = true
         rescue OCIException => e
+          @active = false
           raise OracleEnhanced::ConnectionException, e.message
+        rescue => e
+          @active = false
+          raise
         end
 
-        def active?
-          @raw_connection.active?
-        end
-
+        # Resets connection, by logging off and creating a new connection.
         def reset!
-          @raw_connection.reset!
+          logoff rescue nil
+          @raw_connection = OracleEnhancedOCIFactory.new_connection(@config)
+          @active = true
         rescue OCIException => e
+          @active = false
           raise OracleEnhanced::ConnectionException, e.message
+        rescue => e
+          @active = false
+          raise
         end
 
         def exec(sql, *bindvars, &block)
@@ -99,6 +118,23 @@ module ActiveRecord
 
         def prepare(sql)
           Cursor.new(self, @raw_connection.parse(sql))
+        end
+
+        def with_auto_retry
+          # FIXME: autocommit can throw an exception
+          should_retry = self.class.auto_retry? && autocommit?
+
+          begin
+            yield
+          rescue OCIException => e
+            raise unless e.is_a?(OCIError)
+            raise unless self.class.auto_retry_error_codes.include?(e.code)
+            @active = false
+            raise unless should_retry
+            should_retry = false
+            reset! rescue nil
+            retry
+          end
         end
 
         class Cursor
@@ -363,80 +399,3 @@ module ActiveRecord
     end
   end
 end
-
-# The OCI8AutoRecover class enhances the OCI8 driver with auto-recover and
-# reset functionality. If a call to #exec fails, and autocommit is turned on
-# (ie., we're not in the middle of a longer transaction), it will
-# automatically reconnect and try again. If autocommit is turned off,
-# this would be dangerous (as the earlier part of the implied transaction
-# may have failed silently if the connection died) -- so instead the
-# connection is marked as dead, to be reconnected on it's next use.
-#:stopdoc:
-class OCI8EnhancedAutoRecover < DelegateClass(OCI8) #:nodoc:
-  attr_accessor :active #:nodoc:
-  alias :active? :active #:nodoc:
-
-  cattr_accessor :auto_retry
-  class << self
-    alias :auto_retry? :auto_retry #:nodoc:
-  end
-  @@auto_retry = false
-
-  def initialize(config, factory) #:nodoc:
-    @active = true
-    @config = config
-    @factory = factory
-    @connection = @factory.new_connection @config
-    super @connection
-  end
-
-  # Checks connection, returns true if active. Note that ping actively
-  # checks the connection, while #active? simply returns the last
-  # known state.
-  def ping #:nodoc:
-    @connection.exec("select 1 from dual") { |r| nil }
-    @active = true
-  rescue
-    @active = false
-    raise
-  end
-
-  # Resets connection, by logging off and creating a new connection.
-  def reset! #:nodoc:
-    logoff rescue nil
-    begin
-      @connection = @factory.new_connection @config
-      __setobj__ @connection
-      @active = true
-    rescue
-      @active = false
-      raise
-    end
-  end
-
-  # ORA-00028: your session has been killed
-  # ORA-01012: not logged on
-  # ORA-03113: end-of-file on communication channel
-  # ORA-03114: not connected to ORACLE
-  # ORA-03135: connection lost contact
-  LOST_CONNECTION_ERROR_CODES = [ 28, 1012, 3113, 3114, 3135 ] #:nodoc:
-
-  # Adds auto-recovery functionality.
-  #
-  # See: http://www.jiubao.org/ruby-oci8/api.en.html#label-11
-  def exec(sql, *bindvars, &block) #:nodoc:
-    should_retry = self.class.auto_retry? && autocommit?
-
-    begin
-      @connection.exec(sql, *bindvars, &block)
-    rescue OCIException => e
-      raise unless e.is_a?(OCIError) && LOST_CONNECTION_ERROR_CODES.include?(e.code)
-      @active = false
-      raise unless should_retry
-      should_retry = false
-      reset! rescue nil
-      retry
-    end
-  end
-end
-#:startdoc:
