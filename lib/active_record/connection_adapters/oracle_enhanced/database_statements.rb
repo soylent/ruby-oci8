@@ -10,7 +10,7 @@ module ActiveRecord
 
         # Executes a SQL statement
         def execute(sql, name = nil)
-          log(sql, name) { with_auto_retry { @connection.exec(sql) } }
+          log(sql, name) { @connection.exec(sql) }
         end
 
         def clear_cache! # :nodoc:
@@ -24,7 +24,7 @@ module ActiveRecord
           log(sql, name, binds, type_casted_binds) do
             cursor = nil
             cached = false
-            with_auto_retry do
+            with_retry do
               cursor = nil
               cached = false
               if without_prepared_statement?(binds)
@@ -100,28 +100,34 @@ module ActiveRecord
 
           log(sql, name, binds, type_casted_binds) do
             cached = false
-            returning_id_col = returning_id_index = nil
-            if without_prepared_statement?(binds)
-              cursor = @connection.prepare(sql)
-            else
-              unless @statements.key?(sql)
-                @statements[sql] = @connection.prepare(sql)
+            cursor = nil
+            cursor = returning_id_col = returning_id_index = nil
+            with_retry do
+              cached = false
+              cursor = nil
+              returning_id_col = returning_id_index = nil
+              if without_prepared_statement?(binds)
+                cursor = @connection.prepare(sql)
+              else
+                unless @statements.key?(sql)
+                  @statements[sql] = @connection.prepare(sql)
+                end
+
+                cursor = @statements[sql]
+
+                cursor.bind_params(type_casted_binds)
+
+                if /:returning_id/.match?(sql)
+                  # it currently expects that returning_id comes last part of binds
+                  returning_id_index = binds.size
+                  cursor.bind_returning_param(returning_id_index, Integer)
+                end
+
+                cached = true
               end
 
-              cursor = @statements[sql]
-
-              cursor.bind_params(type_casted_binds)
-
-              if /:returning_id/.match?(sql)
-                # it currently expects that returning_id comes last part of binds
-                returning_id_index = binds.size
-                cursor.bind_returning_param(returning_id_index, Integer)
-              end
-
-              cached = true
+              cursor.exec_update
             end
-
-            cursor.exec_update
 
             rows = []
             if returning_id_index
@@ -138,24 +144,26 @@ module ActiveRecord
           type_casted_binds = type_casted_binds(binds)
 
           log(sql, name, binds, type_casted_binds) do
-            cached = false
-            if without_prepared_statement?(binds)
-              cursor = @connection.prepare(sql)
-            else
-              if @statements.key?(sql)
-                cursor = @statements[sql]
+            with_retry do
+              cached = false
+              if without_prepared_statement?(binds)
+                cursor = @connection.prepare(sql)
               else
-                cursor = @statements[sql] = @connection.prepare(sql)
+                if @statements.key?(sql)
+                  cursor = @statements[sql]
+                else
+                  cursor = @statements[sql] = @connection.prepare(sql)
+                end
+
+                cursor.bind_params(type_casted_binds)
+
+                cached = true
               end
 
-              cursor.bind_params(type_casted_binds)
-
-              cached = true
+              res = cursor.exec_update
+              cursor.close unless cached
+              res
             end
-
-            res = cursor.exec_update
-            cursor.close unless cached
-            res
           end
         end
 
@@ -270,8 +278,8 @@ module ActiveRecord
 
         private
 
-        def with_auto_retry
-          @connection.with_auto_retry do
+        def with_retry
+          @connection.with_retry do
             begin
               yield
             rescue
