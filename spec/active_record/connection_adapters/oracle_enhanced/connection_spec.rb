@@ -387,10 +387,17 @@ describe "OracleEnhancedConnection" do
   end
 
   describe "auto reconnection" do
+    include SchemaSpecHelper
+
     before(:all) do
       ActiveRecord::Base.establish_connection(CONNECTION_PARAMS)
       @conn = ActiveRecord::Base.connection.instance_variable_get("@connection")
       @sys_conn = ActiveRecord::ConnectionAdapters::OracleEnhanced::Connection.create(SYS_CONNECTION_PARAMS)
+      schema_define do
+        create_table :posts, force: true
+      end
+      class ::Post < ActiveRecord::Base
+      end
     end
 
     before(:each) do
@@ -439,6 +446,14 @@ describe "OracleEnhancedConnection" do
       else
         expect { @conn.select("SELECT * FROM dual") }.to raise_error(OCIError)
       end
+    end
+
+    it "should reconnect and execute query if connection is lost and auto retry is enabled" do
+      Post.create!
+      # @conn.auto_retry = true
+      ActiveRecord::Base.connection.auto_retry = true
+      kill_current_session
+      expect(Post.take).not_to be_nil
     end
   end
 
